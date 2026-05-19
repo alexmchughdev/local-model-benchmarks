@@ -4,6 +4,8 @@ set -eu
 # ============================================================
 # Saves benchmark data to /data
 # Intended to run from Portainer / Docker / Linux shell
+# In the loom-harness stack, /data is bind-mounted from the host
+# /var/lib/ubuntu, so results are visible to File Browser.
 # ============================================================
 
 OUT_ROOT="${OUT_ROOT:-/data/benchmarks}"
@@ -689,24 +691,24 @@ download_models() {
     }
 
     download_if_missing \
-        "Qwen2.5-1.5B-Instruct-Q4_K_M.gguf" \
-        "https://huggingface.co/bartowski/Qwen2.5-1.5B-Instruct-GGUF/resolve/main/Qwen2.5-1.5B-Instruct-Q4_K_M.gguf"
+        "Llama-3.2-3B-Instruct-Q4_K_M.gguf" \
+        "https://huggingface.co/bartowski/Llama-3.2-3B-Instruct-GGUF/resolve/main/Llama-3.2-3B-Instruct-Q4_K_M.gguf"
 
     download_if_missing \
-        "SmolLM2-1.7B-Instruct-Q4_K_M.gguf" \
-        "https://huggingface.co/bartowski/SmolLM2-1.7B-Instruct-GGUF/resolve/main/SmolLM2-1.7B-Instruct-Q4_K_M.gguf"
+        "HuggingFaceTB_SmolLM3-3B-Q4_K_M.gguf" \
+        "https://huggingface.co/bartowski/HuggingFaceTB_SmolLM3-3B-GGUF/resolve/main/HuggingFaceTB_SmolLM3-3B-Q4_K_M.gguf"
 
     download_if_missing \
-        "gemma-2-2b-it-Q4_K_M.gguf" \
-        "https://huggingface.co/bartowski/gemma-2-2b-it-GGUF/resolve/main/gemma-2-2b-it-Q4_K_M.gguf"
+        "google_gemma-3-4b-it-Q4_K_M.gguf" \
+        "https://huggingface.co/bartowski/google_gemma-3-4b-it-GGUF/resolve/main/google_gemma-3-4b-it-Q4_K_M.gguf"
 
     download_if_missing \
-        "Qwen2.5-3B-Instruct-Q4_K_M.gguf" \
-        "https://huggingface.co/bartowski/Qwen2.5-3B-Instruct-GGUF/resolve/main/Qwen2.5-3B-Instruct-Q4_K_M.gguf"
+        "Qwen_Qwen3-4B-Instruct-2507-Q4_K_M.gguf" \
+        "https://huggingface.co/bartowski/Qwen_Qwen3-4B-Instruct-2507-GGUF/resolve/main/Qwen_Qwen3-4B-Instruct-2507-Q4_K_M.gguf"
 
     download_if_missing \
-        "Phi-3.1-mini-4k-instruct-Q4_K_M.gguf" \
-        "https://huggingface.co/bartowski/Phi-3.1-mini-4k-instruct-GGUF/resolve/main/Phi-3.1-mini-4k-instruct-Q4_K_M.gguf"
+        "microsoft_Phi-4-mini-instruct-Q4_K_M.gguf" \
+        "https://huggingface.co/bartowski/microsoft_Phi-4-mini-instruct-GGUF/resolve/main/microsoft_Phi-4-mini-instruct-Q4_K_M.gguf"
 }
 
 # ------------------------------------------------------------
