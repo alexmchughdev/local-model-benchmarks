@@ -33,10 +33,6 @@ TEST_CLEARANCE="${TEST_CLEARANCE:-}"
 TEST_EXTERNAL_FAN="${TEST_EXTERNAL_FAN:-}"
 TEST_NOTES="${TEST_NOTES:-}"
 
-mkdir -p "$OUT_DIR" "$MODELS_DIR"
-
-echo "[+] Benchmark output directory: $OUT_DIR"
-
 # ------------------------------------------------------------
 # Basic dependency installation
 # ------------------------------------------------------------
@@ -879,17 +875,144 @@ run_basic_benchmarks() {
 }
 
 # ------------------------------------------------------------
+# Preflight (smoke test) — verify the environment can run a full
+# benchmark before doing anything expensive. Exits non-zero if any
+# critical check fails.
+#
+# Set ALLOW_NO_THERMAL=1 to demote the thermal-sensor check from
+# fail to warn (useful for ad-hoc test runs where you don't need
+# real thermal data).
+# ------------------------------------------------------------
+
+preflight_checks() {
+    echo "[+] Running preflight checks..."
+
+    PREFLIGHT_FAILED=0
+    PREFLIGHT_WARNINGS=0
+
+    preflight_fail() {
+        echo "[!] FAIL: $1"
+        PREFLIGHT_FAILED=$((PREFLIGHT_FAILED + 1))
+    }
+
+    preflight_warn() {
+        echo "[~] WARN: $1"
+        PREFLIGHT_WARNINGS=$((PREFLIGHT_WARNINGS + 1))
+    }
+
+    # Shell: 'time' as a reserved word requires bash, not dash.
+    if [ -z "${BASH_VERSION:-}" ]; then
+        preflight_fail "Must run with bash (uses 'time' as a reserved word). Try: bash $0"
+    fi
+
+    # Writable output, models, and llama.cpp parent directories.
+    if ! mkdir -p "$OUT_ROOT" 2>/dev/null || [ ! -w "$OUT_ROOT" ]; then
+        preflight_fail "OUT_ROOT=$OUT_ROOT is not writable"
+    fi
+    if ! mkdir -p "$MODELS_DIR" 2>/dev/null || [ ! -w "$MODELS_DIR" ]; then
+        preflight_fail "MODELS_DIR=$MODELS_DIR is not writable"
+    fi
+    LLAMA_PARENT="$(dirname "$LLAMA_DIR")"
+    if ! mkdir -p "$LLAMA_PARENT" 2>/dev/null || [ ! -w "$LLAMA_PARENT" ]; then
+        preflight_fail "LLAMA_DIR parent=$LLAMA_PARENT is not writable"
+    fi
+
+    # Disk space: rough lower bound to fit llama.cpp build + default models.
+    REQUIRED_KB=20971520
+    AVAILABLE_KB="$(df -k "$OUT_ROOT" 2>/dev/null | awk 'NR==2 {print $4}')"
+    if [ -n "$AVAILABLE_KB" ] && [ "$AVAILABLE_KB" -lt "$REQUIRED_KB" ]; then
+        AVAIL_GB=$((AVAILABLE_KB / 1048576))
+        preflight_fail "Need >=20 GB free in $OUT_ROOT, only ${AVAIL_GB} GB available"
+    fi
+
+    # Network reach: huggingface.co (model downloads) or github.com (llama.cpp).
+    NEED_NET=0
+    [ "${DOWNLOAD_MODELS:-0}" = "1" ] && NEED_NET=1
+    [ ! -d "$LLAMA_DIR/.git" ] && NEED_NET=1
+    if [ "$NEED_NET" -eq 1 ]; then
+        if ! wget -q --spider --timeout=10 https://huggingface.co 2>/dev/null \
+           && ! wget -q --spider --timeout=10 https://github.com 2>/dev/null; then
+            preflight_fail "Cannot reach huggingface.co or github.com (network down?)"
+        fi
+    fi
+
+    # CPU thermal sensors visible: thermal_zone OR hwmon with CPU-ish label.
+    THERMAL_FOUND=0
+    for ZONE in /sys/class/thermal/thermal_zone*; do
+        [ -r "$ZONE/temp" ] || continue
+        TYPE="$(cat "$ZONE/type" 2>/dev/null || true)"
+        if is_cpu_thermal_label "$TYPE"; then
+            THERMAL_FOUND=1
+            break
+        fi
+    done
+    if [ "$THERMAL_FOUND" -eq 0 ]; then
+        for HWM in /sys/class/hwmon/hwmon*; do
+            [ -d "$HWM" ] || continue
+            NAME="$(cat "$HWM/name" 2>/dev/null || true)"
+            if is_cpu_thermal_label "$NAME"; then
+                THERMAL_FOUND=1
+                break
+            fi
+        done
+    fi
+    if [ "$THERMAL_FOUND" -eq 0 ]; then
+        if [ "${ALLOW_NO_THERMAL:-0}" = "1" ]; then
+            preflight_warn "No CPU thermal sensors visible; thermal data will be empty (ALLOW_NO_THERMAL=1 set, continuing)"
+        else
+            preflight_fail "No CPU thermal sensors visible at /sys/class/thermal or /sys/class/hwmon. Bind-mount /sys/class/thermal, /sys/class/hwmon, /sys/devices into the container; or set ALLOW_NO_THERMAL=1 to ignore."
+        fi
+    fi
+
+    # Build deps: present OR installable via apt-get as root.
+    NEED_APT=0
+    for cmd in git cmake make gcc g++ wget; do
+        if ! command -v "$cmd" >/dev/null 2>&1; then
+            NEED_APT=1
+            break
+        fi
+    done
+    if [ "$NEED_APT" -eq 1 ]; then
+        if ! command -v apt-get >/dev/null 2>&1; then
+            preflight_fail "Missing build deps and apt-get unavailable. Install git, cmake, make, gcc, g++, wget manually."
+        elif [ "$(id -u)" -ne 0 ]; then
+            preflight_fail "Need root for apt-get install of missing build deps. Run as root or pre-install: git cmake make gcc g++ wget."
+        fi
+    fi
+
+    if [ "$PREFLIGHT_FAILED" -gt 0 ]; then
+        echo "[!] Preflight failed: $PREFLIGHT_FAILED error(s), $PREFLIGHT_WARNINGS warning(s). Aborting before benchmark."
+        exit 1
+    fi
+    if [ "$PREFLIGHT_WARNINGS" -gt 0 ]; then
+        echo "[+] Preflight passed with $PREFLIGHT_WARNINGS warning(s)"
+    else
+        echo "[+] Preflight passed"
+    fi
+}
+
+# ------------------------------------------------------------
 # Main
 # ------------------------------------------------------------
 
-echo "[+] Starting benchmark run: $RUN_ID"
+main() {
+    mkdir -p "$OUT_DIR" "$MODELS_DIR"
+    echo "[+] Benchmark output directory: $OUT_DIR"
+    echo "[+] Starting benchmark run: $RUN_ID"
 
-install_deps
-capture_system_info
-build_llama_cpp
-download_models
-run_basic_benchmarks
-run_llm_benchmarks
+    preflight_checks
+    install_deps
+    capture_system_info
+    build_llama_cpp
+    download_models
+    run_basic_benchmarks
+    run_llm_benchmarks
 
-echo "[+] Complete."
-echo "[+] Results saved to: $OUT_DIR"
+    echo "[+] Complete."
+    echo "[+] Results saved to: $OUT_DIR"
+}
+
+# Allow sourcing for tests by skipping the main flow when BENCH_NOMAIN=1.
+if [ "${BENCH_NOMAIN:-0}" != "1" ]; then
+    main
+fi
