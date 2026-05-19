@@ -768,6 +768,18 @@ build_llama_cpp() {
 # Set DOWNLOAD_MODELS=1 to enable
 # ------------------------------------------------------------
 
+download_if_missing() {
+    FILE="$1"
+    URL="$2"
+
+    if [ -f "$FILE" ]; then
+        echo "[+] Already exists: $FILE"
+    else
+        echo "[+] Downloading: $FILE"
+        wget -O "$FILE" "$URL"
+    fi
+}
+
 download_models() {
     if [ "${DOWNLOAD_MODELS:-0}" != "1" ]; then
         echo "[+] Skipping model download. Set DOWNLOAD_MODELS=1 to download defaults."
@@ -777,18 +789,6 @@ download_models() {
     echo "[+] Downloading default GGUF models to $MODELS_DIR..."
 
     cd "$MODELS_DIR"
-
-    download_if_missing() {
-        FILE="$1"
-        URL="$2"
-
-        if [ -f "$FILE" ]; then
-            echo "[+] Already exists: $FILE"
-        else
-            echo "[+] Downloading: $FILE"
-            wget -O "$FILE" "$URL"
-        fi
-    }
 
     download_if_missing \
         "Llama-3.2-3B-Instruct-Q4_K_M.gguf" \
@@ -817,15 +817,86 @@ download_models() {
     download_if_missing \
         "mistralai_Ministral-3-3B-Instruct-2512-Q4_K_M.gguf" \
         "https://huggingface.co/bartowski/mistralai_Ministral-3-3B-Instruct-2512-GGUF/resolve/main/mistralai_Ministral-3-3B-Instruct-2512-Q4_K_M.gguf"
-
-    download_if_missing \
-        "ibm-granite_granite-3.3-8b-instruct-Q4_K_M.gguf" \
-        "https://huggingface.co/bartowski/ibm-granite_granite-3.3-8b-instruct-GGUF/resolve/main/ibm-granite_granite-3.3-8b-instruct-Q4_K_M.gguf"
 }
 
 # ------------------------------------------------------------
 # Run benchmarks
 # ------------------------------------------------------------
+
+benchmark_one_model() {
+    model="$1"
+    for t in $THREADS; do
+        for ngl in $NGL_VALUES; do
+            if [ "$ngl" -eq 0 ]; then
+                BACKEND_LABEL="cpu"
+            else
+                BACKEND_LABEL="gpu"
+            fi
+            RUN_LABEL="$(basename "$model") t=$t ngl=$ngl ($BACKEND_LABEL)"
+            echo "[+] Benchmarking $RUN_LABEL..."
+
+            THERMAL_STABILIZATION="$(wait_for_cpu_thermal_stabilization "$RUN_LABEL")"
+            THERMAL_BEFORE="$(cpu_thermal_snapshot_json)"
+            THERMAL_SAMPLES_FILE="$OUT_DIR/tmp-thermal-samples.tsv"
+            start_cpu_thermal_sampler "$THERMAL_SAMPLES_FILE"
+            BENCH_STATUS=0
+
+            "$BENCH_BIN" \
+                -m "$model" \
+                -t "$t" \
+                -p "$PROMPT_TOKENS" \
+                -n "$GEN_TOKENS" \
+                -r "$REPETITIONS" \
+                -ngl "$ngl" \
+                -o json \
+                > "$OUT_DIR/tmp-result.json" || BENCH_STATUS="$?"
+
+            stop_cpu_thermal_sampler "$THERMAL_SAMPLER_PID"
+            THERMAL_DURING="$(cpu_thermal_samples_json "$THERMAL_SAMPLES_FILE")"
+            THERMAL_AFTER="$(cpu_thermal_snapshot_json)"
+
+            if [ "$BENCH_STATUS" -ne 0 ]; then
+                echo "[!] llama-bench failed for $RUN_LABEL"
+                if [ "$ngl" -eq 0 ]; then
+                    # CPU run is the baseline. A failure here is fatal.
+                    exit "$BENCH_STATUS"
+                else
+                    # GPU run failed (no Vulkan device, OOM on iGPU,
+                    # backend mismatch). Log and continue with the
+                    # other configs so the run still produces data.
+                    continue
+                fi
+            fi
+
+            jq -c \
+                --arg run_id "$RUN_ID" \
+                --arg model_file "$(basename "$model")" \
+                --arg threads "$t" \
+                --arg ngl "$ngl" \
+                --arg backend_label "$BACKEND_LABEL" \
+                --argjson test_metadata "$TEST_METADATA" \
+                --argjson hardware_metadata "$HARDWARE_METADATA" \
+                --argjson cpu_thermal_stabilization "$THERMAL_STABILIZATION" \
+                --argjson cpu_thermal_before "$THERMAL_BEFORE" \
+                --argjson cpu_thermal_during "$THERMAL_DURING" \
+                --argjson cpu_thermal_after "$THERMAL_AFTER" \
+                '.[] + {
+                    run_id: $run_id,
+                    model_file: $model_file,
+                    threads_requested: ($threads | tonumber),
+                    n_gpu_layers_requested: ($ngl | tonumber),
+                    backend_label: $backend_label,
+                    test_metadata: $test_metadata,
+                    hardware_metadata: $hardware_metadata,
+                    cpu_thermal_stabilization: $cpu_thermal_stabilization,
+                    cpu_thermal_before: $cpu_thermal_before,
+                    cpu_thermal_during: $cpu_thermal_during,
+                    cpu_thermal_after: $cpu_thermal_after
+                }' \
+                "$OUT_DIR/tmp-result.json" >> "$JSONL"
+        done
+    done
+}
 
 run_llm_benchmarks() {
     BENCH_BIN="$LLAMA_DIR/build/bin/llama-bench"
@@ -841,84 +912,49 @@ run_llm_benchmarks() {
     MODEL_COUNT="$(find "$MODELS_DIR" -maxdepth 1 -name "*.gguf" | wc -l | tr -d ' ')"
 
     if [ "$MODEL_COUNT" = "0" ]; then
-        echo "[!] No .gguf models found in $MODELS_DIR"
-        echo "[!] Put models in /data/models or run with DOWNLOAD_MODELS=1"
+        echo "[+] No persistent .gguf models in $MODELS_DIR (streaming step may still run)."
         return
     fi
 
     for model in "$MODELS_DIR"/*.gguf; do
-        for t in $THREADS; do
-            for ngl in $NGL_VALUES; do
-                if [ "$ngl" -eq 0 ]; then
-                    BACKEND_LABEL="cpu"
-                else
-                    BACKEND_LABEL="gpu"
-                fi
-                RUN_LABEL="$(basename "$model") t=$t ngl=$ngl ($BACKEND_LABEL)"
-                echo "[+] Benchmarking $RUN_LABEL..."
-
-                THERMAL_STABILIZATION="$(wait_for_cpu_thermal_stabilization "$RUN_LABEL")"
-                THERMAL_BEFORE="$(cpu_thermal_snapshot_json)"
-                THERMAL_SAMPLES_FILE="$OUT_DIR/tmp-thermal-samples.tsv"
-                start_cpu_thermal_sampler "$THERMAL_SAMPLES_FILE"
-                BENCH_STATUS=0
-
-                "$BENCH_BIN" \
-                    -m "$model" \
-                    -t "$t" \
-                    -p "$PROMPT_TOKENS" \
-                    -n "$GEN_TOKENS" \
-                    -r "$REPETITIONS" \
-                    -ngl "$ngl" \
-                    -o json \
-                    > "$OUT_DIR/tmp-result.json" || BENCH_STATUS="$?"
-
-                stop_cpu_thermal_sampler "$THERMAL_SAMPLER_PID"
-                THERMAL_DURING="$(cpu_thermal_samples_json "$THERMAL_SAMPLES_FILE")"
-                THERMAL_AFTER="$(cpu_thermal_snapshot_json)"
-
-                if [ "$BENCH_STATUS" -ne 0 ]; then
-                    echo "[!] llama-bench failed for $RUN_LABEL"
-                    if [ "$ngl" -eq 0 ]; then
-                        # CPU run is the baseline. A failure here is fatal.
-                        exit "$BENCH_STATUS"
-                    else
-                        # GPU run failed (no Vulkan device, OOM on iGPU,
-                        # backend mismatch). Log and continue with the
-                        # other configs so the run still produces data.
-                        continue
-                    fi
-                fi
-
-                jq -c \
-                    --arg run_id "$RUN_ID" \
-                    --arg model_file "$(basename "$model")" \
-                    --arg threads "$t" \
-                    --arg ngl "$ngl" \
-                    --arg backend_label "$BACKEND_LABEL" \
-                    --argjson test_metadata "$TEST_METADATA" \
-                    --argjson hardware_metadata "$HARDWARE_METADATA" \
-                    --argjson cpu_thermal_stabilization "$THERMAL_STABILIZATION" \
-                    --argjson cpu_thermal_before "$THERMAL_BEFORE" \
-                    --argjson cpu_thermal_during "$THERMAL_DURING" \
-                    --argjson cpu_thermal_after "$THERMAL_AFTER" \
-                    '.[] + {
-                        run_id: $run_id,
-                        model_file: $model_file,
-                        threads_requested: ($threads | tonumber),
-                        n_gpu_layers_requested: ($ngl | tonumber),
-                        backend_label: $backend_label,
-                        test_metadata: $test_metadata,
-                        hardware_metadata: $hardware_metadata,
-                        cpu_thermal_stabilization: $cpu_thermal_stabilization,
-                        cpu_thermal_before: $cpu_thermal_before,
-                        cpu_thermal_during: $cpu_thermal_during,
-                        cpu_thermal_after: $cpu_thermal_after
-                    }' \
-                    "$OUT_DIR/tmp-result.json" >> "$JSONL"
-            done
-        done
+        benchmark_one_model "$model"
     done
+}
+
+# Streaming models: download, benchmark, then delete. Lets us include
+# larger models on hosts with limited disk by holding only one big GGUF
+# on disk at a time.
+run_streaming_models() {
+    if [ "${DOWNLOAD_MODELS:-0}" != "1" ]; then
+        echo "[+] Skipping streaming models (DOWNLOAD_MODELS=0)."
+        return
+    fi
+
+    echo "[+] Running streaming benchmarks (download, run, delete)..."
+
+    stream_one() {
+        FILE="$1"
+        URL="$2"
+        TARGET="$MODELS_DIR/$FILE"
+        echo "[+] Streaming model: $FILE"
+        if [ ! -f "$TARGET" ]; then
+            wget -O "$TARGET" "$URL"
+        fi
+        benchmark_one_model "$TARGET"
+        echo "[+] Removing streamed model: $FILE"
+        rm -f "$TARGET"
+    }
+
+    stream_one \
+        "ibm-granite_granite-3.3-8b-instruct-Q4_K_M.gguf" \
+        "https://huggingface.co/bartowski/ibm-granite_granite-3.3-8b-instruct-GGUF/resolve/main/ibm-granite_granite-3.3-8b-instruct-Q4_K_M.gguf"
+}
+
+finalize_outputs() {
+    [ -s "$JSONL" ] || {
+        echo "[!] No benchmark rows recorded; skipping finalize."
+        return 0
+    }
 
     jq -s '.' "$JSONL" > "$RAW_JSON"
 
@@ -1060,12 +1096,16 @@ preflight_checks() {
         preflight_fail "LLAMA_DIR parent=$LLAMA_PARENT is not writable"
     fi
 
-    # Disk space: rough lower bound to fit llama.cpp build + default models.
-    REQUIRED_KB=20971520
-    AVAILABLE_KB="$(df -k "$OUT_ROOT" 2>/dev/null | awk 'NR==2 {print $4}')"
+    # Disk space: enough to hold the llama.cpp build plus a working set
+    # of resident models. Granite (and any other streamed entries) are
+    # downloaded and deleted one at a time so they don't require full
+    # peak headroom.
+    REQUIRED_KB="${REQUIRED_KB:-10485760}"
+    AVAILABLE_KB="$(df -k "$OUT_ROOT" 2>/dev/null | awk '/[0-9]/ {a=$4} END {print a}')"
     if [ -n "$AVAILABLE_KB" ] && [ "$AVAILABLE_KB" -lt "$REQUIRED_KB" ]; then
         AVAIL_GB=$((AVAILABLE_KB / 1048576))
-        preflight_fail "Need >=20 GB free in $OUT_ROOT, only ${AVAIL_GB} GB available"
+        REQUIRED_GB=$((REQUIRED_KB / 1048576))
+        preflight_fail "Need >=${REQUIRED_GB} GB free in $OUT_ROOT, only ${AVAIL_GB} GB available (override REQUIRED_KB to change)"
     fi
 
     # Network reach: huggingface.co (model downloads) or github.com (llama.cpp).
@@ -1168,6 +1208,8 @@ main() {
     download_models
     run_basic_benchmarks
     run_llm_benchmarks
+    run_streaming_models
+    finalize_outputs
 
     echo "[+] Complete."
     echo "[+] Results saved to: $OUT_DIR"
