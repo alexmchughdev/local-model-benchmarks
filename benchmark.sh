@@ -699,6 +699,10 @@ download_models() {
         "https://huggingface.co/bartowski/google_gemma-3-4b-it-GGUF/resolve/main/google_gemma-3-4b-it-Q4_K_M.gguf"
 
     download_if_missing \
+        "google_gemma-4-E4B-it-Q4_K_M.gguf" \
+        "https://huggingface.co/bartowski/google_gemma-4-E4B-it-GGUF/resolve/main/google_gemma-4-E4B-it-Q4_K_M.gguf"
+
+    download_if_missing \
         "Qwen_Qwen3-4B-Instruct-2507-Q4_K_M.gguf" \
         "https://huggingface.co/bartowski/Qwen_Qwen3-4B-Instruct-2507-GGUF/resolve/main/Qwen_Qwen3-4B-Instruct-2507-Q4_K_M.gguf"
 
