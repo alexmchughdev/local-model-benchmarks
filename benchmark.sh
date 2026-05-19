@@ -1,28 +1,29 @@
-#!/bin/sh
+#!/usr/bin/env bash
 set -eu
 
 # ============================================================
-# Saves benchmark data to /data
-# Intended to run from Portainer / Docker / Linux shell
-# In the loom-harness stack, /data is bind-mounted from the host
-# /var/lib/ubuntu, so results are visible to File Browser.
+# Bare-metal OnLogic K802 benchmark for an installed Ubuntu host.
+# Persistent models, llama.cpp build output, benchmark results, and
+# dashboards live under DATA_ROOT by default.
 # ============================================================
 
-OUT_ROOT="${OUT_ROOT:-/data/benchmarks}"
+DATA_ROOT="${DATA_ROOT:-/opt/k802-bench}"
+OUT_ROOT="${OUT_ROOT:-$DATA_ROOT/benchmarks}"
 RUN_ID="$(date -u +"%Y%m%dT%H%M%SZ")"
 OUT_DIR="$OUT_ROOT/$RUN_ID"
 
-MODELS_DIR="${MODELS_DIR:-/data/models}"
-LLAMA_DIR="${LLAMA_DIR:-/data/llama.cpp}"
-THREADS="${THREADS:-2 4 8}"
+MODELS_DIR="${MODELS_DIR:-$DATA_ROOT/models}"
+LLAMA_DIR="${LLAMA_DIR:-$DATA_ROOT/llama.cpp}"
+THREADS="${THREADS:-2 4 6 8}"
 PROMPT_TOKENS="${PROMPT_TOKENS:-512}"
 GEN_TOKENS="${GEN_TOKENS:-128}"
 REPETITIONS="${REPETITIONS:-3}"
 # Layers to offload to GPU per run. Space-separated list. 0 = CPU only.
 # 999 = all layers (full iGPU/dGPU offload, llama-bench clamps to model max).
-# Default tests CPU-only and full iGPU offload back to back.
-NGL_VALUES="${NGL_VALUES:-0 999}"
-ENABLE_VULKAN="${ENABLE_VULKAN:-1}"
+# Default is CPU-only. Set ENABLE_VULKAN=1 NGL_VALUES="0 999" for
+# an additional iGPU/Vulkan pass on hosts where that is useful.
+NGL_VALUES="${NGL_VALUES:-0}"
+ENABLE_VULKAN="${ENABLE_VULKAN:-0}"
 THERMAL_SAMPLE_INTERVAL="${THERMAL_SAMPLE_INTERVAL:-2}"
 THERMAL_STABILIZE="${THERMAL_STABILIZE:-1}"
 THERMAL_STABLE_POLL_INTERVAL="${THERMAL_STABLE_POLL_INTERVAL:-5}"
@@ -55,9 +56,13 @@ install_deps() {
     fi
 
     if command -v apt-get >/dev/null 2>&1; then
+        export DEBIAN_FRONTEND=noninteractive
         apt-get update
         # shellcheck disable=SC2086
-        apt-get install -y build-essential cmake git jq curl wget procps util-linux $APT_VULKAN
+        apt-get install -y \
+            build-essential cmake git jq curl wget procps util-linux \
+            pciutils lm-sensors msr-tools smartmontools nvme-cli python3 \
+            $APT_VULKAN
     elif command -v dnf >/dev/null 2>&1; then
         # shellcheck disable=SC2086
         dnf install -y gcc gcc-c++ cmake git make jq curl wget procps-ng util-linux $DNF_VULKAN
@@ -67,6 +72,16 @@ install_deps() {
     else
         echo "[!] Could not detect package manager. Install gcc, g++, cmake, git, jq, wget manually."
     fi
+}
+
+prepare_host_sensors() {
+    if [ "$(id -u)" -ne 0 ]; then
+        echo "[~] Not root; skipping kernel module setup for coretemp/msr."
+        return
+    fi
+
+    modprobe coretemp 2>/dev/null || true
+    modprobe msr 2>/dev/null || true
 }
 
 # ------------------------------------------------------------
@@ -284,7 +299,7 @@ is_cpu_thermal_label() {
     CPU_THERMAL_LABEL="$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')"
 
     case "$CPU_THERMAL_LABEL" in
-        *cpu*|*x86*|*pkg*|*package*|*coretemp*|*k10temp*|*zenpower*|*tctl*|*tdie*|*acpitz*|*soc*|*bcm2835*|*arm*thermal*)
+        *cpu*|*x86*|*pkg*|*package*|*coretemp*|*k10temp*|*zenpower*|*tctl*|*tdie*|*soc*|*bcm2835*|*arm*thermal*)
             return 0
             ;;
         *)
@@ -803,6 +818,10 @@ download_models() {
         "https://huggingface.co/bartowski/google_gemma-4-E4B-it-GGUF/resolve/main/google_gemma-4-E4B-it-Q4_K_M.gguf"
 
     download_if_missing \
+        "google_gemma-4-E2B-it-Q4_K_M.gguf" \
+        "https://huggingface.co/bartowski/google_gemma-4-E2B-it-GGUF/resolve/main/google_gemma-4-E2B-it-Q4_K_M.gguf"
+
+    download_if_missing \
         "Qwen_Qwen3.5-4B-Q4_K_M.gguf" \
         "https://huggingface.co/bartowski/Qwen_Qwen3.5-4B-GGUF/resolve/main/Qwen_Qwen3.5-4B-Q4_K_M.gguf"
 
@@ -813,6 +832,10 @@ download_models() {
     download_if_missing \
         "mistralai_Ministral-3-3B-Instruct-2512-Q4_K_M.gguf" \
         "https://huggingface.co/bartowski/mistralai_Ministral-3-3B-Instruct-2512-GGUF/resolve/main/mistralai_Ministral-3-3B-Instruct-2512-Q4_K_M.gguf"
+
+    download_if_missing \
+        "ibm-granite_granite-3.3-8b-instruct-Q4_K_M.gguf" \
+        "https://huggingface.co/bartowski/ibm-granite_granite-3.3-8b-instruct-GGUF/resolve/main/ibm-granite_granite-3.3-8b-instruct-Q4_K_M.gguf"
 }
 
 # ------------------------------------------------------------
@@ -908,46 +931,13 @@ run_llm_benchmarks() {
     MODEL_COUNT="$(find "$MODELS_DIR" -maxdepth 1 -name "*.gguf" | wc -l | tr -d ' ')"
 
     if [ "$MODEL_COUNT" = "0" ]; then
-        echo "[+] No persistent .gguf models in $MODELS_DIR (streaming step may still run)."
+        echo "[+] No .gguf models in $MODELS_DIR."
         return
     fi
 
     for model in "$MODELS_DIR"/*.gguf; do
         benchmark_one_model "$model"
     done
-}
-
-# Streaming models: download, benchmark, then delete. Lets us include
-# larger models on hosts with limited disk by holding only one big GGUF
-# on disk at a time.
-run_streaming_models() {
-    if [ "${STREAM_LARGE_MODELS:-1}" != "1" ]; then
-        echo "[+] Skipping streaming models (STREAM_LARGE_MODELS=0)."
-        return
-    fi
-    if [ "${DOWNLOAD_MODELS:-0}" != "1" ]; then
-        echo "[+] Skipping streaming models (DOWNLOAD_MODELS=0)."
-        return
-    fi
-
-    echo "[+] Running streaming benchmarks (download, run, delete)..."
-
-    stream_one() {
-        FILE="$1"
-        URL="$2"
-        TARGET="$MODELS_DIR/$FILE"
-        echo "[+] Streaming model: $FILE"
-        if [ ! -f "$TARGET" ]; then
-            wget -O "$TARGET" "$URL"
-        fi
-        benchmark_one_model "$TARGET"
-        echo "[+] Removing streamed model: $FILE"
-        rm -f "$TARGET"
-    }
-
-    stream_one \
-        "ibm-granite_granite-3.3-8b-instruct-Q4_K_M.gguf" \
-        "https://huggingface.co/bartowski/ibm-granite_granite-3.3-8b-instruct-GGUF/resolve/main/ibm-granite_granite-3.3-8b-instruct-Q4_K_M.gguf"
 }
 
 finalize_outputs() {
@@ -1096,11 +1086,9 @@ preflight_checks() {
         preflight_fail "LLAMA_DIR parent=$LLAMA_PARENT is not writable"
     fi
 
-    # Disk space: enough to hold the llama.cpp build plus a working set
-    # of resident models. Granite (and any other streamed entries) are
-    # downloaded and deleted one at a time so they don't require full
-    # peak headroom.
-    REQUIRED_KB="${REQUIRED_KB:-10485760}"
+    # Disk space: enough for llama.cpp, build artifacts, downloaded GGUF
+    # models, benchmark outputs, and temporary files.
+    REQUIRED_KB="${REQUIRED_KB:-41943040}"
     AVAILABLE_KB="$(df -k "$OUT_ROOT" 2>/dev/null | awk '/[0-9]/ {a=$4} END {print a}')"
     if [ -n "$AVAILABLE_KB" ] && [ "$AVAILABLE_KB" -lt "$REQUIRED_KB" ]; then
         AVAIL_GB=$((AVAILABLE_KB / 1048576))
@@ -1113,9 +1101,20 @@ preflight_checks() {
     [ "${DOWNLOAD_MODELS:-0}" = "1" ] && NEED_NET=1
     [ ! -d "$LLAMA_DIR/.git" ] && NEED_NET=1
     if [ "$NEED_NET" -eq 1 ]; then
-        if ! wget -q --spider --timeout=10 https://huggingface.co 2>/dev/null \
-           && ! wget -q --spider --timeout=10 https://github.com 2>/dev/null; then
-            preflight_fail "Cannot reach huggingface.co or github.com (network down?)"
+        NET_OK=0
+        if command -v wget >/dev/null 2>&1; then
+            if wget -q --spider --timeout=10 https://huggingface.co 2>/dev/null \
+               || wget -q --spider --timeout=10 https://github.com 2>/dev/null; then
+                NET_OK=1
+            fi
+        elif command -v curl >/dev/null 2>&1; then
+            if curl -fsS --max-time 10 -I https://huggingface.co >/dev/null 2>&1 \
+               || curl -fsS --max-time 10 -I https://github.com >/dev/null 2>&1; then
+                NET_OK=1
+            fi
+        fi
+        if [ "$NET_OK" -eq 0 ]; then
+            preflight_fail "Cannot reach huggingface.co or github.com, or neither wget nor curl is available yet."
         fi
     fi
 
@@ -1143,7 +1142,7 @@ preflight_checks() {
         if [ "${ALLOW_NO_THERMAL:-0}" = "1" ]; then
             preflight_warn "No CPU thermal sensors visible; thermal data will be empty (ALLOW_NO_THERMAL=1 set, continuing)"
         else
-            preflight_fail "No CPU thermal sensors visible at /sys/class/thermal or /sys/class/hwmon. Bind-mount /sys/class/thermal, /sys/class/hwmon, /sys/devices into the container; or set ALLOW_NO_THERMAL=1 to ignore."
+            preflight_fail "No CPU thermal sensors visible at /sys/class/thermal or /sys/class/hwmon. On Ubuntu bare metal, run as root so the script can load coretemp, or run: sudo modprobe coretemp. Set ALLOW_NO_THERMAL=1 only for non-thermal smoke tests."
         fi
     fi
 
@@ -1160,7 +1159,7 @@ preflight_checks() {
             if [ "${ALLOW_NO_GPU:-0}" = "1" ]; then
                 preflight_warn "/dev/dri not visible; GPU offload runs will fail (ALLOW_NO_GPU=1 set, continuing with CPU-only data)"
             else
-                preflight_fail "/dev/dri not visible. Expose the iGPU to the container (devices: /dev/dri:/dev/dri, group_add: video render) or set NGL_VALUES=0 to skip GPU runs, or set ALLOW_NO_GPU=1 to ignore."
+                preflight_fail "/dev/dri not visible. Set NGL_VALUES=0 for CPU-only, or install/enable the iGPU drivers. Set ALLOW_NO_GPU=1 only for smoke tests."
             fi
         fi
     fi
@@ -1201,14 +1200,15 @@ main() {
     echo "[+] Benchmark output directory: $OUT_DIR"
     echo "[+] Starting benchmark run: $RUN_ID"
 
+    prepare_host_sensors
     preflight_checks
     install_deps
+    prepare_host_sensors
     capture_system_info
     build_llama_cpp
     download_models
     run_basic_benchmarks
     run_llm_benchmarks
-    run_streaming_models
     finalize_outputs
 
     echo "[+] Complete."

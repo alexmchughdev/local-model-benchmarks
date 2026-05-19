@@ -87,9 +87,8 @@ test_thermal_label_positive() {
     is_cpu_thermal_label "coretemp" || return 1
     is_cpu_thermal_label "x86_pkg_temp" || return 2
     is_cpu_thermal_label "CPU thermal" || return 3
-    is_cpu_thermal_label "acpitz" || return 4
-    is_cpu_thermal_label "k10temp" || return 5
-    is_cpu_thermal_label "Package" || return 6
+    is_cpu_thermal_label "k10temp" || return 4
+    is_cpu_thermal_label "Package" || return 5
 }
 
 test_thermal_label_negative() {
@@ -97,7 +96,8 @@ test_thermal_label_negative() {
     if is_cpu_thermal_label "amdgpu"; then return 2; fi
     if is_cpu_thermal_label "wifi"; then return 3; fi
     if is_cpu_thermal_label "battery"; then return 4; fi
-    if is_cpu_thermal_label ""; then return 5; fi
+    if is_cpu_thermal_label "acpitz"; then return 5; fi
+    if is_cpu_thermal_label ""; then return 6; fi
     return 0
 }
 
@@ -166,8 +166,8 @@ echo
 echo "Preflight tests:"
 # Defaults: ALLOW_NO_THERMAL=1 so dev machines without /sys/class/thermal
 # (Macs, restricted containers) don't fail every test.
-run_preflight "preflight passes on writable tmp + ALLOW_NO_THERMAL + ALLOW_NO_GPU" pass ALLOW_NO_THERMAL=1 ALLOW_NO_GPU=1
-run_preflight "preflight fails on unwritable OUT_ROOT"                              fail ALLOW_NO_THERMAL=1 ALLOW_NO_GPU=1 OUT_ROOT=/proc/forbidden/out
+run_preflight "preflight passes on writable tmp + ALLOW_NO_THERMAL + ALLOW_NO_GPU" pass ALLOW_NO_THERMAL=1 ALLOW_NO_GPU=1 REQUIRED_KB=1024
+run_preflight "preflight fails on unwritable OUT_ROOT"                              fail ALLOW_NO_THERMAL=1 ALLOW_NO_GPU=1 REQUIRED_KB=1024 OUT_ROOT=/proc/forbidden/out
 
 echo
 echo "============================="

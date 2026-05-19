@@ -72,6 +72,11 @@ def parse_args() -> argparse.Namespace:
         default="auto",
         help="Benchmark type to use for sustained-use ranking. Default: auto, preferring tg when present.",
     )
+    parser.add_argument(
+        "--no-thermal",
+        action="store_true",
+        help="Exclude CPU temperature, stabilization, and thermal scoring from the dashboard and CSV exports.",
+    )
     return parser.parse_args()
 
 
@@ -381,7 +386,10 @@ def choose_primary_type(throughput_rows: list[dict[str, Any]], requested: str) -
 
 
 def score_sustained_use(
-    throughput_rows: list[dict[str, Any]], primary_type: str | None, thermal_limit_c: float
+    throughput_rows: list[dict[str, Any]],
+    primary_type: str | None,
+    thermal_limit_c: float,
+    include_thermal: bool = True,
 ) -> list[dict[str, Any]]:
     candidates = [
         row.copy()
@@ -398,10 +406,10 @@ def score_sustained_use(
     for row in candidates:
         avg_ts = number(row.get("avg_ts"))
         stddev_ts = number(row.get("stddev_ts"))
-        peak_c = number(row.get("during_max_c"))
-        before_c = number(row.get("before_max_c"))
-        wait_s = number(row.get("stabilization_waited_seconds"))
-        timed_out = bool(row.get("stabilization_timed_out"))
+        peak_c = number(row.get("during_max_c")) if include_thermal else None
+        before_c = number(row.get("before_max_c")) if include_thermal else None
+        wait_s = number(row.get("stabilization_waited_seconds")) if include_thermal else None
+        timed_out = bool(row.get("stabilization_timed_out")) if include_thermal else False
 
         cv = None
         if avg_ts is not None and avg_ts > 0 and stddev_ts is not None:
@@ -435,13 +443,19 @@ def score_sustained_use(
         else:
             cooldown_component = clamp(1.0 - wait_s / 300.0)
 
-        sustained_score = 100.0 * (
-            0.35 * throughput_component
-            + 0.20 * variance_component
-            + 0.25 * thermal_headroom_component
-            + 0.10 * thermal_rise_component
-            + 0.10 * cooldown_component
-        )
+        if include_thermal:
+            sustained_score = 100.0 * (
+                0.35 * throughput_component
+                + 0.20 * variance_component
+                + 0.25 * thermal_headroom_component
+                + 0.10 * thermal_rise_component
+                + 0.10 * cooldown_component
+            )
+        else:
+            sustained_score = 100.0 * (
+                0.75 * throughput_component
+                + 0.25 * variance_component
+            )
 
         row.update(
             {
@@ -753,6 +767,7 @@ def make_metric_cards(
     invocations: list[dict[str, Any]],
     sustained_rows: list[dict[str, Any]],
     primary_type: str | None,
+    include_thermal: bool = True,
 ) -> list[tuple[str, str]]:
     models = sorted({row["model"] for row in rows})
     threads = sorted({row["threads"] for row in rows if row["threads"] is not None})
@@ -771,7 +786,7 @@ def make_metric_cards(
             best = max(typed, key=lambda row: row["avg_ts"])
             best_by_type.append(f"{bench_type}: {fmt(best['avg_ts'])}")
 
-    return [
+    cards = [
         ("Records", str(len(rows))),
         ("Device", ", ".join(devices) if devices else "not captured"),
         ("Hardware", ", ".join(products) if products else "not captured"),
@@ -781,16 +796,18 @@ def make_metric_cards(
         ("Thread Counts", ", ".join(str(thread) for thread in threads) or "unknown"),
         ("Benchmark Types", ", ".join(types) or "unknown"),
         ("Primary Type", primary_type or "unknown"),
-        ("Ambient", f"{fmt(ambient)} C" if ambient is not None else "not captured"),
-        ("Peak CPU Temp", f"{fmt(peak_temp)} C" if peak_temp is not None else "not captured"),
         ("Best Throughput", "; ".join(best_by_type) or "not available"),
         (
-            "Top Sustained Pick",
+            "Top Sustained Pick" if include_thermal else "Top Ranked Pick",
             f"{config_label(top_sustained)} ({fmt(top_sustained['sustained_score'])})"
             if top_sustained
             else "not available",
         ),
     ]
+    if include_thermal:
+        cards.insert(9, ("Ambient", f"{fmt(ambient)} C" if ambient is not None else "not captured"))
+        cards.insert(10, ("Peak CPU Temp", f"{fmt(peak_temp)} C" if peak_temp is not None else "not captured"))
+    return cards
 
 
 def table_html(headers: list[str], rows: list[list[Any]]) -> str:
@@ -812,10 +829,11 @@ def build_dashboard_html(
     sustained_rows: list[dict[str, Any]],
     primary_type: str | None,
     thermal_limit_c: float,
+    include_thermal: bool = True,
 ) -> str:
     generated_at = dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
     run_ids = sorted({str(row["run_id"]) for row in rows if row.get("run_id")})
-    cards = make_metric_cards(rows, throughput_rows, invocations, sustained_rows, primary_type)
+    cards = make_metric_cards(rows, throughput_rows, invocations, sustained_rows, primary_type, include_thermal)
 
     best_rows: list[list[Any]] = []
     for bench_type in sorted({row["type"] for row in throughput_rows}):
@@ -828,7 +846,7 @@ def build_dashboard_html(
                     row["threads"] if row["threads"] is not None else "",
                     fmt(row["avg_ts"]),
                     fmt(row["stddev_ts"]),
-                    fmt(row["during_max_c"]),
+                    fmt(row["during_max_c"]) if include_thermal else None,
                 ]
             )
 
@@ -846,60 +864,85 @@ def build_dashboard_html(
         if row.get("during_max_c") is not None or row.get("stabilization_reason")
     ]
 
-    sustained_table_rows = [
-        [
-            rank,
-            row["model"],
-            row["threads"] if row["threads"] is not None else "",
-            fmt(row["sustained_score"]),
-            fmt(row["avg_ts"]),
-            fmt(row["cv_pct"]),
-            fmt(row["during_max_c"]),
-            fmt(row["thermal_headroom_c"]),
-            fmt(row["temp_rise_c"]),
-            fmt(row["stabilization_waited_seconds"]),
-            row["stabilization_reason"] or "",
+    if include_thermal:
+        sustained_table_rows = [
+            [
+                rank,
+                row["model"],
+                row["threads"] if row["threads"] is not None else "",
+                fmt(row["sustained_score"]),
+                fmt(row["avg_ts"]),
+                fmt(row["cv_pct"]),
+                fmt(row["during_max_c"]),
+                fmt(row["thermal_headroom_c"]),
+                fmt(row["temp_rise_c"]),
+                fmt(row["stabilization_waited_seconds"]),
+                row["stabilization_reason"] or "",
+            ]
+            for rank, row in enumerate(sustained_rows[:20], start=1)
         ]
-        for rank, row in enumerate(sustained_rows[:20], start=1)
-    ]
+    else:
+        sustained_table_rows = [
+            [
+                rank,
+                row["model"],
+                row["threads"] if row["threads"] is not None else "",
+                fmt(row["sustained_score"]),
+                fmt(row["avg_ts"]),
+                fmt(row["cv_pct"]),
+            ]
+            for rank, row in enumerate(sustained_rows[:20], start=1)
+        ]
 
     card_html = "".join(
         f'<div class="metric"><div class="metric-label">{esc(label)}</div><div class="metric-value">{esc(value)}</div></div>'
         for label, value in cards
     )
-    figure_html = "".join(
-        f"""
-        <section class="figure-block">
-            <div class="figure-title">
-                <h2>{esc(figure["title"])}</h2>
-                <a href="{esc(figure["href"])}">Open SVG</a>
-            </div>
-            <img src="{esc(figure["href"])}" alt="{esc(figure["title"])}">
-        </section>
-        """
-        for figure in figures
-    )
+    figure_blocks = []
+    for figure in figures:
+        figure_path = output_dir / figure["href"]
+        if figure_path.exists():
+            figure_body = figure_path.read_text(encoding="utf-8")
+        else:
+            figure_body = f"<p>Figure file not found: {esc(figure['href'])}</p>"
+        figure_blocks.append(
+            f"""
+            <section class="figure-block">
+                <div class="figure-title">
+                    <h2>{esc(figure["title"])}</h2>
+                </div>
+                <div class="inline-figure">{figure_body}</div>
+            </section>
+            """
+        )
+    figure_html = "".join(figure_blocks)
 
-    best_table = table_html(
-        ["Type", "Model", "Threads", "Avg tok/s", "Stddev", "Peak CPU C"],
-        best_rows,
-    )
-    sustained_table = table_html(
-        [
+    best_headers = ["Type", "Model", "Threads", "Avg tok/s", "Stddev"]
+    if include_thermal:
+        best_headers.append("Peak CPU C")
+    else:
+        best_rows = [row[:-1] for row in best_rows]
+    best_table = table_html(best_headers, best_rows)
+
+    sustained_headers = [
             "Rank",
             "Model",
             "Threads",
             "Score",
             "Avg tok/s",
             "CV %",
+    ]
+    if include_thermal:
+        sustained_headers.extend(
+            [
             "Peak CPU C",
             "Headroom C",
             "Rise C",
             "Wait s",
             "Stabilize Reason",
-        ],
-        sustained_table_rows,
-    )
+            ]
+        )
+    sustained_table = table_html(sustained_headers, sustained_table_rows)
     thermal_table = table_html(
         ["Model", "Threads", "Before C", "Peak C", "After C", "Stabilize Wait s", "Stabilize Reason"],
         thermal_rows,
@@ -907,6 +950,19 @@ def build_dashboard_html(
 
     relative_input = os.path.relpath(input_path, output_dir)
     run_text = ", ".join(run_ids) if run_ids else "not present in JSON"
+    if include_thermal:
+        dashboard_note = f'This dashboard ranks model/thread configurations for unattended fanless operation on OnLogic K802 industrial PCs. The sustained score uses {esc(primary_type or "the selected")} throughput, throughput variance, CPU thermal headroom against {esc(fmt(thermal_limit_c))} C, temperature rise, and stabilization wait time. Standalone figure files are in the <strong>figures</strong> folder next to this dashboard.'
+        ranking_heading = "Sustained Use Ranking"
+        thermal_section = f"""
+        <section class="table-block">
+            <h2>Thermal Summary</h2>
+            {thermal_table}
+        </section>
+        """
+    else:
+        dashboard_note = f'This dashboard intentionally excludes CPU temperature and stabilization data. The ranking uses {esc(primary_type or "the selected")} throughput and throughput variance only. Standalone figure files are in the <strong>figures</strong> folder next to this dashboard.'
+        ranking_heading = "Performance Ranking"
+        thermal_section = ""
 
     return f"""<!doctype html>
 <html lang="en">
@@ -997,7 +1053,7 @@ def build_dashboard_html(
             text-decoration: none;
             font-weight: 600;
         }}
-        img {{
+        .inline-figure svg {{
             display: block;
             width: 100%;
             height: auto;
@@ -1043,21 +1099,18 @@ def build_dashboard_html(
         <p class="subtle">Generated: {esc(generated_at)}</p>
     </header>
     <main>
-        <p class="note">This dashboard ranks model/thread configurations for unattended fanless operation on OnLogic K802 industrial PCs. The sustained score uses {esc(primary_type or "the selected")} throughput, throughput variance, CPU thermal headroom against {esc(fmt(thermal_limit_c))} C, temperature rise, and stabilization wait time. Standalone figure files are in the <strong>figures</strong> folder next to this dashboard.</p>
+        <p class="note">{dashboard_note}</p>
         <section class="metrics">{card_html}</section>
         {figure_html}
         <section class="table-block">
-            <h2>Sustained Use Ranking</h2>
+            <h2>{ranking_heading}</h2>
             {sustained_table}
         </section>
         <section class="table-block">
             <h2>Best Results</h2>
             {best_table}
         </section>
-        <section class="table-block">
-            <h2>Thermal Summary</h2>
-            {thermal_table}
-        </section>
+        {thermal_section}
     </main>
 </body>
 </html>
@@ -1071,6 +1124,7 @@ def generate_dashboard(
     max_bars: int,
     thermal_limit_c: float,
     requested_primary_type: str,
+    include_thermal: bool = True,
 ) -> None:
     records = load_records(input_path)
     if not records:
@@ -1080,7 +1134,7 @@ def generate_dashboard(
     throughput_rows = aggregate_throughput(rows)
     invocations = aggregate_invocations(rows)
     primary_type = choose_primary_type(throughput_rows, requested_primary_type)
-    sustained_rows = score_sustained_use(throughput_rows, primary_type, thermal_limit_c)
+    sustained_rows = score_sustained_use(throughput_rows, primary_type, thermal_limit_c, include_thermal)
 
     output_dir.mkdir(parents=True, exist_ok=True)
     figures_dir = output_dir / "figures"
@@ -1089,17 +1143,19 @@ def generate_dashboard(
     figures: list[dict[str, str]] = []
     benchmark_types = sorted({row["type"] for row in throughput_rows})
 
-    sustained_path = figures_dir / "sustained-use-ranking.svg"
+    sustained_path = figures_dir / ("sustained-use-ranking.svg" if include_thermal else "performance-ranking.svg")
     render_bar_chart(
         sustained_path,
-        "Sustained Use Ranking",
-        "Composite score for unattended fanless operation: throughput, variance, thermal headroom, temperature rise, and cooldown wait.",
+        "Sustained Use Ranking" if include_thermal else "Performance Ranking",
+        "Composite score for unattended fanless operation: throughput, variance, thermal headroom, temperature rise, and cooldown wait."
+        if include_thermal
+        else "Composite score using throughput and throughput variance only. CPU temperature data is excluded.",
         sustained_rows,
         "sustained_score",
         "score",
         max_bars,
     )
-    figures.append({"title": "Sustained Use Ranking", "href": f"figures/{sustained_path.name}"})
+    figures.append({"title": "Sustained Use Ranking" if include_thermal else "Performance Ranking", "href": f"figures/{sustained_path.name}"})
 
     for bench_type in benchmark_types:
         typed = [row for row in throughput_rows if row["type"] == bench_type]
@@ -1125,136 +1181,144 @@ def generate_dashboard(
         )
         figures.append({"title": f"Thread Scaling: {bench_type}", "href": f"figures/{line_path.name}"})
 
-    thermal_chart_rows = [
-        {"model": row["model"], "threads": row["threads"], "during_max_c": row["during_max_c"]}
-        for row in invocations
-    ]
-    peak_temp_path = figures_dir / "cpu-peak-temperature.svg"
-    render_bar_chart(
-        peak_temp_path,
-        "Peak CPU Temperature",
-        "Maximum CPU temperature sampled while each benchmark invocation was running.",
-        thermal_chart_rows,
-        "during_max_c",
-        "C",
-        max_bars,
-    )
-    figures.append({"title": "Peak CPU Temperature", "href": f"figures/{peak_temp_path.name}"})
-
-    wait_chart_rows = [
-        {
-            "model": row["model"],
-            "threads": row["threads"],
-            "stabilization_waited_seconds": row["stabilization_waited_seconds"],
-        }
-        for row in invocations
-    ]
-    wait_path = figures_dir / "cpu-stabilization-wait.svg"
-    render_bar_chart(
-        wait_path,
-        "CPU Temperature Stabilization Wait",
-        "Seconds spent waiting for CPU temperature to settle before each benchmark invocation.",
-        wait_chart_rows,
-        "stabilization_waited_seconds",
-        "s",
-        max_bars,
-    )
-    figures.append({"title": "CPU Temperature Stabilization Wait", "href": f"figures/{wait_path.name}"})
-
-    scatter_rows = [
-        row
-        for row in throughput_rows
-        if primary_type is None or row["type"] == primary_type
-    ]
-    scatter_path = figures_dir / "throughput-vs-cpu-temperature.svg"
-    render_scatter_chart(
-        scatter_path,
-        "Throughput vs CPU Temperature",
-        "Each point is one model/thread configuration. Point size increases with thread count.",
-        scatter_rows,
-    )
-    figures.append({"title": "Throughput vs CPU Temperature", "href": f"figures/{scatter_path.name}"})
-
-    write_csv(
-        output_dir / "benchmark-summary.csv",
-        throughput_rows,
-        [
-            "model",
-            "threads",
-            "type",
-            "avg_ts",
-            "stddev_ts",
-            "test_device",
-            "hardware_product",
-            "cpu_model",
-            "logical_cpus",
-            "memory_total_gb",
-            "ambient_c",
-            "cpu_tdp_w",
-            "before_max_c",
+    if include_thermal:
+        thermal_chart_rows = [
+            {"model": row["model"], "threads": row["threads"], "during_max_c": row["during_max_c"]}
+            for row in invocations
+        ]
+        peak_temp_path = figures_dir / "cpu-peak-temperature.svg"
+        render_bar_chart(
+            peak_temp_path,
+            "Peak CPU Temperature",
+            "Maximum CPU temperature sampled while each benchmark invocation was running.",
+            thermal_chart_rows,
             "during_max_c",
-            "during_avg_c",
-            "after_max_c",
+            "C",
+            max_bars,
+        )
+        figures.append({"title": "Peak CPU Temperature", "href": f"figures/{peak_temp_path.name}"})
+
+        wait_chart_rows = [
+            {
+                "model": row["model"],
+                "threads": row["threads"],
+                "stabilization_waited_seconds": row["stabilization_waited_seconds"],
+            }
+            for row in invocations
+        ]
+        wait_path = figures_dir / "cpu-stabilization-wait.svg"
+        render_bar_chart(
+            wait_path,
+            "CPU Temperature Stabilization Wait",
+            "Seconds spent waiting for CPU temperature to settle before each benchmark invocation.",
+            wait_chart_rows,
             "stabilization_waited_seconds",
-            "stabilization_timed_out",
-            "stabilization_reason",
-            "count",
-        ],
-    )
-    write_csv(
-        output_dir / "sustained-use-ranking.csv",
-        sustained_rows,
-        [
-            "model",
-            "threads",
-            "type",
-            "sustained_score",
-            "avg_ts",
-            "stddev_ts",
-            "cv_pct",
-            "test_device",
-            "hardware_product",
-            "cpu_model",
-            "logical_cpus",
-            "memory_total_gb",
-            "ambient_c",
-            "cpu_tdp_w",
-            "before_max_c",
-            "during_max_c",
-            "during_avg_c",
-            "after_max_c",
-            "temp_rise_c",
-            "thermal_headroom_c",
-            "stabilization_waited_seconds",
-            "stabilization_timed_out",
-            "stabilization_reason",
-            "thermal_limit_c",
-        ],
-    )
-    write_csv(
-        output_dir / "thermal-summary.csv",
-        invocations,
-        [
-            "model",
-            "threads",
-            "test_device",
-            "hardware_product",
-            "cpu_model",
-            "logical_cpus",
-            "memory_total_gb",
-            "ambient_c",
-            "cpu_tdp_w",
-            "before_max_c",
-            "during_max_c",
-            "during_avg_c",
-            "after_max_c",
-            "thermal_samples",
-            "stabilized",
-            "stabilization_reason",
-            "stabilization_waited_seconds",
-            "stabilization_final_max_c",
-        ],
-    )
+            "s",
+            max_bars,
+        )
+        figures.append({"title": "CPU Temperature Stabilization Wait", "href": f"figures/{wait_path.name}"})
+
+        scatter_rows = [
+            row
+            for row in throughput_rows
+            if primary_type is None or row["type"] == primary_type
+        ]
+        scatter_path = figures_dir / "throughput-vs-cpu-temperature.svg"
+        render_scatter_chart(
+            scatter_path,
+            "Throughput vs CPU Temperature",
+            "Each point is one model/thread configuration. Point size increases with thread count.",
+            scatter_rows,
+        )
+        figures.append({"title": "Throughput vs CPU Temperature", "href": f"figures/{scatter_path.name}"})
+
+    benchmark_columns = [
+        "model",
+        "threads",
+        "type",
+        "avg_ts",
+        "stddev_ts",
+        "test_device",
+        "hardware_product",
+        "cpu_model",
+        "logical_cpus",
+        "memory_total_gb",
+        "count",
+    ]
+    if include_thermal:
+        benchmark_columns.extend(
+            [
+                "ambient_c",
+                "cpu_tdp_w",
+                "before_max_c",
+                "during_max_c",
+                "during_avg_c",
+                "after_max_c",
+                "stabilization_waited_seconds",
+                "stabilization_timed_out",
+                "stabilization_reason",
+            ]
+        )
+    write_csv(output_dir / "benchmark-summary.csv", throughput_rows, benchmark_columns)
+
+    ranking_columns = [
+        "model",
+        "threads",
+        "type",
+        "sustained_score",
+        "avg_ts",
+        "stddev_ts",
+        "cv_pct",
+        "test_device",
+        "hardware_product",
+        "cpu_model",
+        "logical_cpus",
+        "memory_total_gb",
+    ]
+    if include_thermal:
+        ranking_columns.extend(
+            [
+                "ambient_c",
+                "cpu_tdp_w",
+                "before_max_c",
+                "during_max_c",
+                "during_avg_c",
+                "after_max_c",
+                "temp_rise_c",
+                "thermal_headroom_c",
+                "stabilization_waited_seconds",
+                "stabilization_timed_out",
+                "stabilization_reason",
+                "thermal_limit_c",
+            ]
+        )
+    write_csv(output_dir / "sustained-use-ranking.csv", sustained_rows, ranking_columns)
+
+    if include_thermal:
+        write_csv(
+            output_dir / "thermal-summary.csv",
+            invocations,
+            [
+                "model",
+                "threads",
+                "test_device",
+                "hardware_product",
+                "cpu_model",
+                "logical_cpus",
+                "memory_total_gb",
+                "ambient_c",
+                "cpu_tdp_w",
+                "before_max_c",
+                "during_max_c",
+                "during_avg_c",
+                "after_max_c",
+                "thermal_samples",
+                "stabilized",
+                "stabilization_reason",
+                "stabilization_waited_seconds",
+                "stabilization_final_max_c",
+            ],
+        )
 
     manifest_rows = [{"title": figure["title"], "file": figure["href"]} for figure in figures]
     write_csv(output_dir / "figure-manifest.csv", manifest_rows, ["title", "file"])
@@ -1270,6 +1334,7 @@ def generate_dashboard(
         sustained_rows,
         primary_type,
         thermal_limit_c,
+        include_thermal,
     )
     (output_dir / "index.html").write_text(html_text, encoding="utf-8")
 
@@ -1295,6 +1360,7 @@ def main() -> None:
         args.max_bars,
         args.thermal_limit_c,
         args.primary_type,
+        not args.no_thermal,
     )
 
 
