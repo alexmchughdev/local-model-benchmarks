@@ -921,6 +921,10 @@ run_llm_benchmarks() {
 # larger models on hosts with limited disk by holding only one big GGUF
 # on disk at a time.
 run_streaming_models() {
+    if [ "${STREAM_LARGE_MODELS:-1}" != "1" ]; then
+        echo "[+] Skipping streaming models (STREAM_LARGE_MODELS=0)."
+        return
+    fi
     if [ "${DOWNLOAD_MODELS:-0}" != "1" ]; then
         echo "[+] Skipping streaming models (DOWNLOAD_MODELS=0)."
         return
