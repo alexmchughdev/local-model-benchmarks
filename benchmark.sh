@@ -703,12 +703,20 @@ download_models() {
         "https://huggingface.co/bartowski/google_gemma-4-E4B-it-GGUF/resolve/main/google_gemma-4-E4B-it-Q4_K_M.gguf"
 
     download_if_missing \
-        "Qwen_Qwen3-4B-Instruct-2507-Q4_K_M.gguf" \
-        "https://huggingface.co/bartowski/Qwen_Qwen3-4B-Instruct-2507-GGUF/resolve/main/Qwen_Qwen3-4B-Instruct-2507-Q4_K_M.gguf"
+        "Qwen_Qwen3.5-4B-Q4_K_M.gguf" \
+        "https://huggingface.co/bartowski/Qwen_Qwen3.5-4B-GGUF/resolve/main/Qwen_Qwen3.5-4B-Q4_K_M.gguf"
 
     download_if_missing \
         "microsoft_Phi-4-mini-instruct-Q4_K_M.gguf" \
         "https://huggingface.co/bartowski/microsoft_Phi-4-mini-instruct-GGUF/resolve/main/microsoft_Phi-4-mini-instruct-Q4_K_M.gguf"
+
+    download_if_missing \
+        "mistralai_Ministral-3-3B-Instruct-2512-Q4_K_M.gguf" \
+        "https://huggingface.co/bartowski/mistralai_Ministral-3-3B-Instruct-2512-GGUF/resolve/main/mistralai_Ministral-3-3B-Instruct-2512-Q4_K_M.gguf"
+
+    download_if_missing \
+        "ibm-granite_granite-3.3-8b-instruct-Q4_K_M.gguf" \
+        "https://huggingface.co/bartowski/ibm-granite_granite-3.3-8b-instruct-GGUF/resolve/main/ibm-granite_granite-3.3-8b-instruct-Q4_K_M.gguf"
 }
 
 # ------------------------------------------------------------
