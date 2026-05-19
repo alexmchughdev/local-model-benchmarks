@@ -18,6 +18,11 @@ THREADS="${THREADS:-2 4 8}"
 PROMPT_TOKENS="${PROMPT_TOKENS:-512}"
 GEN_TOKENS="${GEN_TOKENS:-128}"
 REPETITIONS="${REPETITIONS:-3}"
+# Layers to offload to GPU per run. Space-separated list. 0 = CPU only.
+# 999 = all layers (full iGPU/dGPU offload, llama-bench clamps to model max).
+# Default tests CPU-only and full iGPU offload back to back.
+NGL_VALUES="${NGL_VALUES:-0 999}"
+ENABLE_VULKAN="${ENABLE_VULKAN:-1}"
 THERMAL_SAMPLE_INTERVAL="${THERMAL_SAMPLE_INTERVAL:-2}"
 THERMAL_STABILIZE="${THERMAL_STABILIZE:-1}"
 THERMAL_STABLE_POLL_INTERVAL="${THERMAL_STABLE_POLL_INTERVAL:-5}"
@@ -38,13 +43,27 @@ TEST_NOTES="${TEST_NOTES:-}"
 # ------------------------------------------------------------
 
 install_deps() {
+    # Vulkan packages are only added when ENABLE_VULKAN=1, so a CPU-only
+    # run still works on hosts without Mesa or an Intel/AMD ICD.
+    APT_VULKAN=""
+    DNF_VULKAN=""
+    APK_VULKAN=""
+    if [ "${ENABLE_VULKAN:-0}" = "1" ]; then
+        APT_VULKAN="libvulkan-dev mesa-vulkan-drivers vulkan-tools pciutils"
+        DNF_VULKAN="vulkan-loader-devel mesa-vulkan-drivers vulkan-tools pciutils"
+        APK_VULKAN="vulkan-loader-dev mesa-vulkan vulkan-tools pciutils"
+    fi
+
     if command -v apt-get >/dev/null 2>&1; then
         apt-get update
-        apt-get install -y build-essential cmake git jq curl wget procps util-linux
+        # shellcheck disable=SC2086
+        apt-get install -y build-essential cmake git jq curl wget procps util-linux $APT_VULKAN
     elif command -v dnf >/dev/null 2>&1; then
-        dnf install -y gcc gcc-c++ cmake git make jq curl wget procps-ng util-linux
+        # shellcheck disable=SC2086
+        dnf install -y gcc gcc-c++ cmake git make jq curl wget procps-ng util-linux $DNF_VULKAN
     elif command -v apk >/dev/null 2>&1; then
-        apk add --no-cache build-base cmake git jq curl wget procps util-linux
+        # shellcheck disable=SC2086
+        apk add --no-cache build-base cmake git jq curl wget procps util-linux $APK_VULKAN
     else
         echo "[!] Could not detect package manager. Install gcc, g++, cmake, git, jq, wget manually."
     fi
@@ -113,6 +132,40 @@ cpu_frequency_json() {
     '
 }
 
+gpu_devices_json() {
+    if ! command -v lspci >/dev/null 2>&1; then
+        printf '[]'
+        return
+    fi
+
+    # Each line: "0000:00:02.0 VGA compatible controller [0300]: Intel Corporation Raptor Lake-S UHD Graphics [8086:a780] (rev 04)"
+    GPU_LINES="$(lspci -nn 2>/dev/null | grep -iE 'vga|3d|display' || true)"
+    if [ -z "$GPU_LINES" ]; then
+        printf '[]'
+        return
+    fi
+
+    printf '%s\n' "$GPU_LINES" | jq -Rn '
+        [inputs
+         | capture("^(?<addr>[0-9a-f:.]+)\\s+(?<class>[^[]+?)\\s+\\[(?<class_id>[0-9a-f]+)\\]:\\s+(?<desc>.+)$")
+         | {
+             pci_address: .addr,
+             class: (.class | gsub("^ +| +$"; "")),
+             class_id: .class_id,
+             description: .desc
+           }
+        ]
+    '
+}
+
+dri_devices_json() {
+    if [ ! -d /dev/dri ]; then
+        printf '[]'
+        return
+    fi
+    ls -1 /dev/dri 2>/dev/null | jq -Rn '[inputs]'
+}
+
 lsblk_json() {
     if command -v lsblk >/dev/null 2>&1; then
         lsblk -J -b -o NAME,MODEL,SERIAL,SIZE,TYPE,TRAN,ROTA,MOUNTPOINTS 2>/dev/null || printf '{"blockdevices":[]}\n'
@@ -146,6 +199,8 @@ hardware_metadata_json() {
     CPU_GOVERNORS="$(cpu_governors_json)"
     CPU_FREQUENCY="$(cpu_frequency_json)"
     BLOCK_DEVICES="$(lsblk_json)"
+    GPU_DEVICES="$(gpu_devices_json)"
+    DRI_DEVICES="$(dri_devices_json)"
 
     jq -n \
         --arg cpu_model "$CPU_MODEL" \
@@ -172,6 +227,8 @@ hardware_metadata_json() {
         --argjson cpu_governors "$CPU_GOVERNORS" \
         --argjson cpu_frequency "$CPU_FREQUENCY" \
         --argjson block_devices "$BLOCK_DEVICES" \
+        --argjson gpu_devices "$GPU_DEVICES" \
+        --argjson dri_devices "$DRI_DEVICES" \
         '
         def optional_string:
             if . == "" then null else . end;
@@ -214,7 +271,11 @@ hardware_metadata_json() {
                 available_kb: $mem_available_kb_num,
                 total_gb: (if $mem_total_kb_num == null then null else ($mem_total_kb_num / 1024 / 1024) end)
             },
-            storage: $block_devices.blockdevices
+            storage: $block_devices.blockdevices,
+            gpu: {
+                devices: $gpu_devices,
+                dri_nodes: $dri_devices
+            }
         }
     '
 }
@@ -626,6 +687,42 @@ capture_system_info() {
         cat /sys/fs/cgroup/memory.max 2>/dev/null || true
 
         echo ""
+        echo "=== GPU / DISPLAY DEVICES (lspci) ==="
+        if command -v lspci >/dev/null 2>&1; then
+            lspci -nn 2>/dev/null | grep -iE 'vga|3d|display' || echo "(no VGA/3D/Display devices found)"
+        else
+            echo "(lspci not installed)"
+        fi
+
+        echo ""
+        echo "=== /dev/dri ==="
+        ls -la /dev/dri 2>/dev/null || echo "(no /dev/dri exposed)"
+
+        echo ""
+        echo "=== VULKAN DEVICES (vulkaninfo --summary) ==="
+        if command -v vulkaninfo >/dev/null 2>&1; then
+            vulkaninfo --summary 2>&1 | head -80 || true
+        else
+            echo "(vulkaninfo not installed)"
+        fi
+
+        echo ""
+        echo "=== INTEL GPU INFO (intel_gpu_top -L) ==="
+        if command -v intel_gpu_top >/dev/null 2>&1; then
+            intel_gpu_top -L 2>&1 || true
+        else
+            echo "(intel_gpu_top not installed)"
+        fi
+
+        echo ""
+        echo "=== MEMORY DETAIL (dmidecode --type 17) ==="
+        if command -v dmidecode >/dev/null 2>&1; then
+            dmidecode --type 17 2>/dev/null | head -200 || echo "(dmidecode requires root and /dev/mem)"
+        else
+            echo "(dmidecode not installed)"
+        fi
+
+        echo ""
         echo "=== CURRENT PROCESSES TOP ==="
         ps aux --sort=-%cpu | head -20 || true
     } > "$OUT_DIR/system-info.txt"
@@ -648,9 +745,16 @@ build_llama_cpp() {
     echo "[+] Building llama.cpp..."
     cd "$LLAMA_DIR"
 
+    CMAKE_EXTRA_FLAGS=""
+    if [ "${ENABLE_VULKAN:-0}" = "1" ]; then
+        CMAKE_EXTRA_FLAGS="-DGGML_VULKAN=ON"
+    fi
+
+    # shellcheck disable=SC2086
     cmake -B build \
         -DGGML_NATIVE=ON \
-        -DGGML_AVX512=OFF
+        -DGGML_AVX512=OFF \
+        $CMAKE_EXTRA_FLAGS
 
     cmake --build build --config Release -j "$(nproc)"
 
@@ -744,54 +848,75 @@ run_llm_benchmarks() {
 
     for model in "$MODELS_DIR"/*.gguf; do
         for t in $THREADS; do
-            echo "[+] Benchmarking $(basename "$model") with $t threads..."
+            for ngl in $NGL_VALUES; do
+                if [ "$ngl" -eq 0 ]; then
+                    BACKEND_LABEL="cpu"
+                else
+                    BACKEND_LABEL="gpu"
+                fi
+                RUN_LABEL="$(basename "$model") t=$t ngl=$ngl ($BACKEND_LABEL)"
+                echo "[+] Benchmarking $RUN_LABEL..."
 
-            THERMAL_STABILIZATION="$(wait_for_cpu_thermal_stabilization "$(basename "$model") with $t threads")"
-            THERMAL_BEFORE="$(cpu_thermal_snapshot_json)"
-            THERMAL_SAMPLES_FILE="$OUT_DIR/tmp-thermal-samples.tsv"
-            start_cpu_thermal_sampler "$THERMAL_SAMPLES_FILE"
-            BENCH_STATUS=0
+                THERMAL_STABILIZATION="$(wait_for_cpu_thermal_stabilization "$RUN_LABEL")"
+                THERMAL_BEFORE="$(cpu_thermal_snapshot_json)"
+                THERMAL_SAMPLES_FILE="$OUT_DIR/tmp-thermal-samples.tsv"
+                start_cpu_thermal_sampler "$THERMAL_SAMPLES_FILE"
+                BENCH_STATUS=0
 
-            "$BENCH_BIN" \
-                -m "$model" \
-                -t "$t" \
-                -p "$PROMPT_TOKENS" \
-                -n "$GEN_TOKENS" \
-                -r "$REPETITIONS" \
-                -o json \
-                > "$OUT_DIR/tmp-result.json" || BENCH_STATUS="$?"
+                "$BENCH_BIN" \
+                    -m "$model" \
+                    -t "$t" \
+                    -p "$PROMPT_TOKENS" \
+                    -n "$GEN_TOKENS" \
+                    -r "$REPETITIONS" \
+                    -ngl "$ngl" \
+                    -o json \
+                    > "$OUT_DIR/tmp-result.json" || BENCH_STATUS="$?"
 
-            stop_cpu_thermal_sampler "$THERMAL_SAMPLER_PID"
-            THERMAL_DURING="$(cpu_thermal_samples_json "$THERMAL_SAMPLES_FILE")"
-            THERMAL_AFTER="$(cpu_thermal_snapshot_json)"
+                stop_cpu_thermal_sampler "$THERMAL_SAMPLER_PID"
+                THERMAL_DURING="$(cpu_thermal_samples_json "$THERMAL_SAMPLES_FILE")"
+                THERMAL_AFTER="$(cpu_thermal_snapshot_json)"
 
-            if [ "$BENCH_STATUS" -ne 0 ]; then
-                echo "[!] llama-bench failed for $(basename "$model") with $t threads"
-                exit "$BENCH_STATUS"
-            fi
+                if [ "$BENCH_STATUS" -ne 0 ]; then
+                    echo "[!] llama-bench failed for $RUN_LABEL"
+                    if [ "$ngl" -eq 0 ]; then
+                        # CPU run is the baseline. A failure here is fatal.
+                        exit "$BENCH_STATUS"
+                    else
+                        # GPU run failed (no Vulkan device, OOM on iGPU,
+                        # backend mismatch). Log and continue with the
+                        # other configs so the run still produces data.
+                        continue
+                    fi
+                fi
 
-            jq -c \
-                --arg run_id "$RUN_ID" \
-                --arg model_file "$(basename "$model")" \
-                --arg threads "$t" \
-                --argjson test_metadata "$TEST_METADATA" \
-                --argjson hardware_metadata "$HARDWARE_METADATA" \
-                --argjson cpu_thermal_stabilization "$THERMAL_STABILIZATION" \
-                --argjson cpu_thermal_before "$THERMAL_BEFORE" \
-                --argjson cpu_thermal_during "$THERMAL_DURING" \
-                --argjson cpu_thermal_after "$THERMAL_AFTER" \
-                '.[] + {
-                    run_id: $run_id,
-                    model_file: $model_file,
-                    threads_requested: ($threads | tonumber),
-                    test_metadata: $test_metadata,
-                    hardware_metadata: $hardware_metadata,
-                    cpu_thermal_stabilization: $cpu_thermal_stabilization,
-                    cpu_thermal_before: $cpu_thermal_before,
-                    cpu_thermal_during: $cpu_thermal_during,
-                    cpu_thermal_after: $cpu_thermal_after
-                }' \
-                "$OUT_DIR/tmp-result.json" >> "$JSONL"
+                jq -c \
+                    --arg run_id "$RUN_ID" \
+                    --arg model_file "$(basename "$model")" \
+                    --arg threads "$t" \
+                    --arg ngl "$ngl" \
+                    --arg backend_label "$BACKEND_LABEL" \
+                    --argjson test_metadata "$TEST_METADATA" \
+                    --argjson hardware_metadata "$HARDWARE_METADATA" \
+                    --argjson cpu_thermal_stabilization "$THERMAL_STABILIZATION" \
+                    --argjson cpu_thermal_before "$THERMAL_BEFORE" \
+                    --argjson cpu_thermal_during "$THERMAL_DURING" \
+                    --argjson cpu_thermal_after "$THERMAL_AFTER" \
+                    '.[] + {
+                        run_id: $run_id,
+                        model_file: $model_file,
+                        threads_requested: ($threads | tonumber),
+                        n_gpu_layers_requested: ($ngl | tonumber),
+                        backend_label: $backend_label,
+                        test_metadata: $test_metadata,
+                        hardware_metadata: $hardware_metadata,
+                        cpu_thermal_stabilization: $cpu_thermal_stabilization,
+                        cpu_thermal_before: $cpu_thermal_before,
+                        cpu_thermal_during: $cpu_thermal_during,
+                        cpu_thermal_after: $cpu_thermal_after
+                    }' \
+                    "$OUT_DIR/tmp-result.json" >> "$JSONL"
+            done
         done
     done
 
@@ -802,6 +927,8 @@ run_llm_benchmarks() {
             "run_id",
             "model_file",
             "threads",
+            "n_gpu_layers",
+            "backend_label",
             "type",
             "avg_ts",
             "stddev_ts",
@@ -810,6 +937,7 @@ run_llm_benchmarks() {
             "cpu_model",
             "logical_cpus",
             "memory_total_gb",
+            "gpu_description",
             "ambient_c",
             "cpu_tdp_w",
             "cpu_temp_before_max_c",
@@ -828,6 +956,8 @@ run_llm_benchmarks() {
                 .run_id,
                 .model_file,
                 .threads,
+                (.n_gpu_layers // .n_gpu_layers_requested),
+                .backend_label,
                 .type,
                 .avg_ts,
                 .stddev_ts,
@@ -836,6 +966,7 @@ run_llm_benchmarks() {
                 .hardware_metadata.cpu.model,
                 .hardware_metadata.cpu.logical_cpus,
                 .hardware_metadata.memory.total_gb,
+                ((.hardware_metadata.gpu.devices // []) | map(.description) | join("; ")),
                 .test_metadata.ambient_c,
                 .test_metadata.cpu_tdp_w,
                 .cpu_thermal_before.max_c,
@@ -973,6 +1104,24 @@ preflight_checks() {
             preflight_warn "No CPU thermal sensors visible; thermal data will be empty (ALLOW_NO_THERMAL=1 set, continuing)"
         else
             preflight_fail "No CPU thermal sensors visible at /sys/class/thermal or /sys/class/hwmon. Bind-mount /sys/class/thermal, /sys/class/hwmon, /sys/devices into the container; or set ALLOW_NO_THERMAL=1 to ignore."
+        fi
+    fi
+
+    # GPU offload check: only when any non-zero NGL value is requested.
+    GPU_WANTED=0
+    for ngl in $NGL_VALUES; do
+        if [ "$ngl" -ne 0 ] 2>/dev/null; then
+            GPU_WANTED=1
+            break
+        fi
+    done
+    if [ "$GPU_WANTED" -eq 1 ]; then
+        if [ ! -d /dev/dri ] || [ -z "$(ls -A /dev/dri 2>/dev/null)" ]; then
+            if [ "${ALLOW_NO_GPU:-0}" = "1" ]; then
+                preflight_warn "/dev/dri not visible; GPU offload runs will fail (ALLOW_NO_GPU=1 set, continuing with CPU-only data)"
+            else
+                preflight_fail "/dev/dri not visible. Expose the iGPU to the container (devices: /dev/dri:/dev/dri, group_add: video render) or set NGL_VALUES=0 to skip GPU runs, or set ALLOW_NO_GPU=1 to ignore."
+            fi
         fi
     fi
 

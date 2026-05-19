@@ -166,8 +166,8 @@ echo
 echo "Preflight tests:"
 # Defaults: ALLOW_NO_THERMAL=1 so dev machines without /sys/class/thermal
 # (Macs, restricted containers) don't fail every test.
-run_preflight "preflight passes on writable tmp + ALLOW_NO_THERMAL" pass ALLOW_NO_THERMAL=1
-run_preflight "preflight fails on unwritable OUT_ROOT"              fail ALLOW_NO_THERMAL=1 OUT_ROOT=/proc/forbidden/out
+run_preflight "preflight passes on writable tmp + ALLOW_NO_THERMAL + ALLOW_NO_GPU" pass ALLOW_NO_THERMAL=1 ALLOW_NO_GPU=1
+run_preflight "preflight fails on unwritable OUT_ROOT"                              fail ALLOW_NO_THERMAL=1 ALLOW_NO_GPU=1 OUT_ROOT=/proc/forbidden/out
 
 echo
 echo "============================="
